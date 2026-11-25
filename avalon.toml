@@ -1,0 +1,23 @@
+# 项目根目录标记及 main.py 的统一启动配置。
+# 后端配置在 servers/.env；NoneBot 配置在 bot/nonebot/.env.<ENVIRONMENT>。
+[launcher]
+startup_timeout = 120
+
+[goqbot]
+# 使用者自行放入对应操作系统和 CPU 架构的程序，程序文件不提交 Git。
+# 默认文件名为 goqbot；Windows 可改为 goqbot.exe，也可指定实际下载的文件名。
+# main.py 直接执行它，不用 uv，也不调用外部启动脚本。
+# 首次复制到 data/goqbot 运行；数据和自更新副本留在那里。
+# 实际配置固定为 bot/goqbot/config/config.yml，通过 -config 参数读取。
+# 缺少配置时，首次启动由 goqbot 自行生成，填写后再启动整套服务。
+# 已有运行副本不会自动覆盖；手动升级时先停机，再替换 data/goqbot 中的副本。
+binary = "goqbot"
+args = []
+
+[web]
+# 首次运行、依赖文件变化或 node_modules 缺失时，先执行 npm ci。
+# 安装签名及 npm 缓存放 data/cache/npm；--check 只读检查，不安装。
+# Vite 固定使用以下地址和端口；占用时明确报错，不自动换端口。
+enabled = true
+host = "127.0.0.1"
+port = 5173

@@ -1,0 +1,23 @@
+# 根项目只负责进程启动；后端和 NoneBot 分别管理自己的依赖。
+[project]
+name = "avalon-rpg"
+version = "0.1.0"
+description = "阿瓦隆 RPG 统一启动入口"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = []
+exclude = ["servers", "bot/nonebot"]
+
+[tool.ruff]
+cache-dir = "data/cache/ruff/root"
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S608"]
+ignore = ["E501"]

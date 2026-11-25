@@ -1,0 +1,49 @@
+# Python / uv 工具环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# 私密配置；NoneBot 的基础配置不含密钥，单独保留
+.env
+.env.*
+!*.example
+!bot/nonebot/.env
+
+# goqbot 由使用者按平台提供；仅提交说明，不提交程序、配置或本地文件
+/bot/goqbot/*
+!/bot/goqbot/README.md
+
+# 本地数据库及事务辅助文件
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# 所有服务的运行数据和缓存
+/data/*
+!/data/.gitkeep
+
+# 本机账号配置 SQL，可能包含账号及密码哈希
+/sql/local/
+
+# 前端工具依赖
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/*
+!.idea/dictionaries/
+
+# 本地测试脚本不提交 Git（匹配所有目录下 test_ 开头的名称）
+test_*

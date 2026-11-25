@@ -1,0 +1,307 @@
+from tortoise import migrations
+from tortoise.migrations import operations as ops
+from tortoise.fields.base import OnDelete
+from tortoise import fields
+
+class Migration(migrations.Migration):
+    initial = True
+
+    operations = [
+        ops.CreateModel(
+            name='Account',
+            fields=[
+                ('openid', fields.CharField(primary_key=True, unique=True, db_index=True, max_length=64)),
+                ('user_id', fields.CharField(db_index=True, max_length=64)),
+                ('name', fields.CharField(default='', max_length=128)),
+                ('created_at', fields.DatetimeField(auto_now=False, auto_now_add=True)),
+            ],
+            options={'table': 'accounts', 'app': 'game', 'pk_attr': 'openid', 'table_description': '账号登记：QQ 用户编号与昵称（角色建立之前就可能有记录，所以不连角色表）。'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Announcement',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('version', fields.CharField(max_length=32)),
+                ('group_id', fields.BigIntField()),
+                ('sent_at', fields.DatetimeField(auto_now=False, auto_now_add=True)),
+            ],
+            options={'table': 'announcements', 'app': 'game', 'unique_together': (('version', 'group_id'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='CheckinDaily',
+            fields=[
+                ('day', fields.DateField(primary_key=True, unique=True, db_index=True)),
+                ('count', fields.IntField(default=0)),
+            ],
+            options={'table': 'checkin_daily', 'app': 'game', 'pk_attr': 'day'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='KnownGroup',
+            fields=[
+                ('group_id', fields.BigIntField(generated=True, primary_key=True, unique=True, db_index=True)),
+            ],
+            options={'table': 'known_groups', 'app': 'game', 'pk_attr': 'group_id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Player',
+            fields=[
+                ('openid', fields.CharField(primary_key=True, unique=True, db_index=True, max_length=64)),
+                ('level', fields.IntField(default=1)),
+                ('exp', fields.IntField(default=0)),
+                ('hp', fields.IntField(default=100)),
+                ('atk', fields.IntField(default=10)),
+                ('defense', fields.IntField(default=5)),
+                ('agi', fields.IntField(default=5)),
+                ('mp', fields.IntField(default=10)),
+                ('penetration', fields.IntField(default=0)),
+                ('stamina', fields.IntField(default=0)),
+                ('special_stamina', fields.IntField(default=0)),
+                ('created_at', fields.DatetimeField(auto_now=False, auto_now_add=True)),
+            ],
+            options={'table': 'players', 'app': 'game', 'pk_attr': 'openid'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='BagExpand',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='bag_expands', on_delete=OnDelete.CASCADE)),
+                ('gem_name', fields.CharField(max_length=128)),
+            ],
+            options={'table': 'bag_expands', 'app': 'game', 'unique_together': (('player', 'gem_name'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Checkin',
+            fields=[
+                ('player', fields.OneToOneField('game.Player', source_field='player_id', primary_key=True, db_index=True, db_constraint=True, to_field='openid', related_name='checkin', on_delete=OnDelete.CASCADE)),
+                ('count', fields.IntField(default=0)),
+                ('last_date', fields.DateField(null=True)),
+                ('streak', fields.IntField(default=0)),
+                ('owed', fields.IntField(default=0)),
+                ('saved_streak', fields.IntField(default=0)),
+                ('break_owed', fields.IntField(default=0)),
+            ],
+            options={'table': 'checkins', 'app': 'game', 'pk_attr': 'player_id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='EasterRedeem',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('code', fields.CharField(max_length=64)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='easter_redeems', on_delete=OnDelete.CASCADE)),
+            ],
+            options={'table': 'easter_redeems', 'app': 'game', 'unique_together': (('code', 'player'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Equipped',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='equipped', on_delete=OnDelete.CASCADE)),
+                ('slot', fields.CharField(max_length=16)),
+                ('item_id', fields.IntField(null=True)),
+                ('enhance', fields.IntField(default=0)),
+                ('temper', fields.IntField(default=0)),
+            ],
+            options={'table': 'equipped', 'app': 'game', 'unique_together': (('player', 'slot'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='InventoryItem',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='inventory', on_delete=OnDelete.CASCADE)),
+                ('item_id', fields.IntField()),
+                ('enhance', fields.IntField(default=0)),
+                ('temper', fields.IntField(default=0)),
+                ('quantity', fields.IntField(default=1)),
+                ('acquired_at', fields.DatetimeField(auto_now=False, auto_now_add=True)),
+            ],
+            options={'table': 'inventory', 'app': 'game', 'unique_together': (('player', 'item_id', 'enhance', 'temper'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='LastChallenge',
+            fields=[
+                ('player', fields.OneToOneField('game.Player', source_field='player_id', primary_key=True, db_index=True, db_constraint=True, to_field='openid', related_name='last_challenge', on_delete=OnDelete.CASCADE)),
+                ('dungeon_id', fields.IntField()),
+                ('monster_id', fields.CharField(max_length=64)),
+            ],
+            options={'table': 'last_challenges', 'app': 'game', 'pk_attr': 'player_id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='MarketListing',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('seller', fields.ForeignKeyField('game.Player', source_field='seller_id', db_constraint=True, to_field='openid', related_name='listings', on_delete=OnDelete.CASCADE)),
+                ('item_id', fields.IntField()),
+                ('quantity', fields.IntField()),
+                ('unit_price', fields.BigIntField()),
+                ('enhance', fields.IntField(default=0)),
+                ('temper', fields.IntField(default=0)),
+                ('created_at', fields.DatetimeField(auto_now=False, auto_now_add=True)),
+            ],
+            options={'table': 'market_listings', 'app': 'game', 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='MarketWeekly',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='market_weeks', on_delete=OnDelete.CASCADE)),
+                ('week', fields.CharField(max_length=16)),
+                ('used', fields.IntField(default=0)),
+            ],
+            options={'table': 'market_weekly', 'app': 'game', 'unique_together': (('player', 'week'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Pity',
+            fields=[
+                ('player', fields.OneToOneField('game.Player', source_field='player_id', primary_key=True, db_index=True, db_constraint=True, to_field='openid', related_name='pity', on_delete=OnDelete.CASCADE)),
+                ('value', fields.IntField(default=0)),
+            ],
+            options={'table': 'pity', 'app': 'game', 'pk_attr': 'player_id', 'table_description': '保底值：全副本共用一个。'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='PropBuff',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='prop_buffs', on_delete=OnDelete.CASCADE)),
+                ('effect', fields.CharField(max_length=64)),
+                ('amount', fields.IntField(default=0)),
+                ('note', fields.CharField(default='', max_length=128)),
+            ],
+            options={'table': 'prop_buffs', 'app': 'game', 'unique_together': (('player', 'effect'),), 'pk_attr': 'id', 'table_description': '已使用、等待下次强化或副本挑战消耗的符咒。'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='RedeemCode',
+            fields=[
+                ('code', fields.CharField(primary_key=True, unique=True, db_index=True, max_length=64)),
+                ('prop_id', fields.IntField()),
+                ('quantity', fields.IntField(default=1)),
+                ('used', fields.BooleanField(default=False)),
+            ],
+            options={'table': 'redeem_codes', 'app': 'game', 'pk_attr': 'code'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='SponsorCard',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='sponsor_cards', on_delete=OnDelete.CASCADE)),
+                ('kind', fields.CharField(max_length=16)),
+                ('expires_on', fields.DateField()),
+            ],
+            options={'table': 'sponsor_cards', 'app': 'game', 'unique_together': (('player', 'kind'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='SponsorGem',
+            fields=[
+                ('name', fields.CharField(primary_key=True, unique=True, db_index=True, max_length=128)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='sponsor_gems', on_delete=OnDelete.CASCADE)),
+                ('pity', fields.BooleanField(default=False)),
+                ('stamina', fields.BooleanField(default=False)),
+                ('boss', fields.BooleanField(default=False)),
+                ('boss_fights', fields.IntField(default=0)),
+                ('hidden_pct', fields.IntField(default=0)),
+                ('drop_pct', fields.IntField(default=0)),
+                ('coin_pct', fields.IntField(default=0)),
+                ('exp_pct', fields.IntField(default=0)),
+                ('chain', fields.BooleanField(default=False)),
+                ('explore', fields.BooleanField(default=False)),
+                ('bless', fields.BooleanField(default=False)),
+            ],
+            options={'table': 'sponsor_gems', 'app': 'game', 'pk_attr': 'name', 'table_description': '定制宝石的功能开关与计数。'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='TowerDaily',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='tower_days', on_delete=OnDelete.CASCADE)),
+                ('day', fields.DateField()),
+                ('used', fields.IntField(default=0)),
+                ('paid', fields.IntField(default=0)),
+                ('bonus_free', fields.IntField(default=0)),
+            ],
+            options={'table': 'tower_daily', 'app': 'game', 'unique_together': (('player', 'day'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='UserBinding',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='bindings', on_delete=OnDelete.CASCADE)),
+                ('platform', fields.CharField(max_length=32)),
+                ('account', fields.CharField(max_length=128)),
+            ],
+            options={'table': 'user_bindings', 'app': 'game', 'unique_together': (('platform', 'account'),), 'pk_attr': 'id', 'table_description': '预留：以后安卓软件的账号与 QQ 角色绑定。'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='Wallet',
+            fields=[
+                ('player', fields.OneToOneField('game.Player', source_field='player_id', primary_key=True, db_index=True, db_constraint=True, to_field='openid', related_name='wallet', on_delete=OnDelete.CASCADE)),
+                ('coins', fields.BigIntField(default=0)),
+                ('world_coins', fields.BigIntField(default=0)),
+                ('bank', fields.BigIntField(default=0)),
+            ],
+            options={'table': 'wallets', 'app': 'game', 'pk_attr': 'player_id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='WarehouseItem',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='warehouse', on_delete=OnDelete.CASCADE)),
+                ('prop_id', fields.IntField()),
+                ('quantity', fields.IntField(default=1)),
+                ('slot', fields.IntField()),
+            ],
+            options={'table': 'warehouse', 'app': 'game', 'unique_together': (('player', 'prop_id'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='WorldBossDaily',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='world_boss_days', on_delete=OnDelete.CASCADE)),
+                ('day', fields.DateField()),
+                ('used', fields.IntField(default=0)),
+                ('last_time', fields.BigIntField(default=0)),
+            ],
+            options={'table': 'world_boss_daily', 'app': 'game', 'unique_together': (('player', 'day'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='WorldBossDamage',
+            fields=[
+                ('id', fields.IntField(generated=True, primary_key=True, unique=True, db_index=True)),
+                ('player', fields.ForeignKeyField('game.Player', source_field='player_id', db_constraint=True, to_field='openid', related_name='world_boss_damage', on_delete=OnDelete.CASCADE)),
+                ('day', fields.DateField(db_index=True)),
+                ('damage', fields.BigIntField(default=0)),
+            ],
+            options={'table': 'world_boss_damage', 'app': 'game', 'unique_together': (('player', 'day'),), 'pk_attr': 'id'},
+            bases=['Model'],
+        ),
+        ops.CreateModel(
+            name='WorldBossSettle',
+            fields=[
+                ('day', fields.DateField(primary_key=True, unique=True, db_index=True)),
+                ('done', fields.BooleanField(default=False)),
+            ],
+            options={'table': 'world_boss_settle', 'app': 'game', 'pk_attr': 'day'},
+            bases=['Model'],
+        ),
+    ]

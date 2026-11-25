@@ -1,0 +1,50 @@
+# 阿瓦隆后端独立 uv 工作区（本身不是可安装的包）
+# 后端：共享数据模型、逻辑后端、API 后端；在 servers/ 中运行
+# 启动后端：uv run app.py（第一次运行会自动安装 Python 3.12 和全部后端依赖）
+[project]
+name = "avalon"
+version = "0.1.0"
+description = "阿瓦隆后端工作区"
+requires-python = ">=3.12,<3.13"
+# 列出全部后端成员，uv run app.py 时会自动装好
+dependencies = [
+    "avalon-logic",
+    "avalon-api",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+avalon-logic = { workspace = true }
+avalon-api = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "contracts",
+    "logic",
+    "api",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["contracts/tests", "logic/tests", "api/tests", "tests"]
+addopts = "-p no:cacheprovider"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+cache-dir = "../data/cache/ruff/servers"
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# S608：禁止用字符串拼接/格式化的方式拼 SQL（防注入）
+select = ["E", "F", "W", "I", "B", "S608"]
+ignore = ["E501"]
