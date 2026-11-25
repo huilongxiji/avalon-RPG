@@ -28,6 +28,8 @@ members = [
 
 [dependency-groups]
 dev = [
+    # servers/tests 也验证根启动器的进程识别。
+    "psutil>=7.2.2,<8",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",

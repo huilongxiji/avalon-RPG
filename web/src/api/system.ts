@@ -24,7 +24,7 @@ export interface ServiceState {
   name: string
   status: ServiceStatus
   pid: number | null
-  restarts: number
+  restarts: number | null
   last_ok: string | null
   message: string
 }

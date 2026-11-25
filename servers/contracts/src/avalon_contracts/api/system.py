@@ -1,4 +1,4 @@
-"""各服务运行状态（编排程序报告，网站显示）。"""
+"""各服务运行状态；探测无法获知的进程信息留空。"""
 
 from __future__ import annotations
 
@@ -25,6 +25,6 @@ class ServiceState(BaseModel):
     name: str
     status: ServiceStatus
     pid: int | None = None
-    restarts: int = 0
+    restarts: int | None = None
     last_ok: datetime | None = None
     message: str = ""

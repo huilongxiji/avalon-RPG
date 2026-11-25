@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -16,12 +17,15 @@ import tomllib
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 sys.pycache_prefix = str(ROOT / "data" / "cache" / "python")
 os.environ["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+if str(ROOT / "servers") not in sys.path:
+    sys.path.insert(0, str(ROOT / "servers"))
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,11 @@ class Service:
     binary_source: Path | None = None
     config_path: Path | None = None
     health_kind: str = "json"
+    key: str = ""
+    dependencies: tuple[str, ...] = ()
+    checks: tuple[tuple[str, str, str], ...] = ()
+    watch_paths: tuple[Path, ...] = ()
+    extra_env: tuple[tuple[str, str], ...] = ()
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -85,9 +94,15 @@ def plan(root: Path, *, reload: bool = False) -> tuple[list[Service], list[str]]
     bot_port = os.environ.get("PORT", bot_values.get("PORT")) or "7891"
     services = [
         Service("后端", [uv, "run", "--locked", "app.py", *(["--reload"] if reload else [])],
-                servers, health_url(host, port), "api"),
+                servers, health_url(host, port), "api", key="backend",
+                checks=((health_url(host, port), "api", "json"),
+                        ("http://127.0.0.1:7901/health", "logic", "json")),
+                watch_paths=(servers / "api/src", servers / "logic/src", servers / "contracts/src",
+                             servers / "app.py", servers / "pyproject.toml", servers / "uv.lock")),
         Service("NoneBot", [uv, "run", "--locked", "bot.py"], bot,
-                health_url(bot_host, bot_port), "bot"),
+                health_url(bot_host, bot_port), "bot", key="nonebot", dependencies=("backend",),
+                watch_paths=(bot / "src", bot / "bot.py", bot / "pyproject.toml", bot / "uv.lock",
+                             servers / "contracts/src"), extra_env=(("FASTAPI_RELOAD", "false"),)),
     ]
     skipped = []
     goqbot = cfg.get("goqbot", {})
@@ -107,7 +122,8 @@ def plan(root: Path, *, reload: bool = False) -> tuple[list[Service], list[str]]
         runtime = root / "data" / "goqbot"
         config = root / "bot" / "goqbot" / "config" / "config.yml"
         services.append(Service("goqbot", [str(runtime / source.name), "-config", str(config), *args], runtime,
-                                binary_source=source, config_path=config))
+                                health=health_url(bot_host, bot_port) + "/onebot", health_kind="onebot",
+                                binary_source=source, config_path=config, key="goqbot", dependencies=("nonebot",)))
     else:
         skipped.append("goqbot 未配置可执行文件，本阶段跳过。")
     web = root / "web"
@@ -125,14 +141,16 @@ def plan(root: Path, *, reload: bool = False) -> tuple[list[Service], list[str]]
         services.append(Service("Vue", [npm, "run", "dev", "--", "--host", web_host,
                                         "--port", str(web_port), "--strictPort"], web,
                                 health_url(web_host, web_port).removesuffix("health"),
-                                health_kind="html"))
+                                health_kind="html", key="web", dependencies=("backend",)))
     else:
         skipped.append("Vue 尚未迁入或已禁用，本阶段跳过。")
     return services, skipped
 
 
 def ensure_ports_free(services: list[Service]) -> None:
-    urls = ["http://127.0.0.1:7901/health", *(s.health for s in services if s.health)]
+    # goqbot 的健康入口属于 NoneBot，不能把它当作 goqbot 要绑定的端口。
+    urls = [url for service in services if service.key != "goqbot"
+            for url, _, _ in (service.checks or ((service.health, "", ""),)) if url]
     for url in dict.fromkeys(urls):
         address = urlsplit(url)
         try:
@@ -201,6 +219,9 @@ def prepare_web_dependencies(root: Path, services: list[Service], env: dict[str,
 
 
 def start(service: Service, env: dict[str, str]) -> subprocess.Popen:
+    if service.key and service.key != "goqbot":
+        # 每次恢复也检查端口，避免残留子进程或其他程序占用时启动第二份。
+        ensure_ports_free([service])
     if service.config_path:
         service.config_path.parent.mkdir(parents=True, exist_ok=True)
     if service.binary_source:
@@ -213,7 +234,11 @@ def start(service: Service, env: dict[str, str]) -> subprocess.Popen:
             if os.name != "nt":
                 runtime.chmod(runtime.stat().st_mode | 0o100)
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-    return subprocess.Popen(service.command, cwd=service.cwd, env=env, **kwargs)
+    from launcher.processes import identity
+
+    process = subprocess.Popen(service.command, cwd=service.cwd, env={**env, **dict(service.extra_env)}, **kwargs)
+    process._avalon_identity = identity(process.pid)
+    return process
 
 
 def wait_ready(service: Service, process: subprocess.Popen, timeout: float) -> None:
@@ -240,115 +265,247 @@ def wait_ready(service: Service, process: subprocess.Popen, timeout: float) -> N
     raise RuntimeError(f"等待 {service.name} 启动超时：{service.health}")
 
 
-def _group_alive(pid: int) -> bool:
-    try:
-        os.killpg(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
+def stop(processes: list[subprocess.Popen], grace: float = 10) -> None:
+    """按创建时记录的进程身份结束进程树，防止 PID 复用时误伤其他程序。"""
+    from launcher.processes import terminate_group
 
-
-def stop(processes: list[subprocess.Popen], grace: float = 15) -> None:
-    """只清理本次创建的进程组；即使 uv 已退出，也回收同组的服务子进程。"""
-    if os.name == "nt":
-        for process in reversed(processes):
+    errors = []
+    for process in reversed(processes):
+        original = getattr(process, "_avalon_identity", None)
+        if original is None:
             if process.poll() is None:
-                try:
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                except OSError:
-                    pass
-        for process in reversed(processes):
+                errors.append("无法确认进程身份，未发送结束信号")
+            continue
+        try:
+            terminate_group(original.pid, original.created, grace=grace)
+            process.wait(timeout=2)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc))
+    if errors:
+        raise RuntimeError("；".join(errors))
+
+
+ALIASES = {"bot": "nonebot", "servers": "backend", "vue": "web"}
+COMPONENTS = {"backend", "nonebot", "goqbot", "web"}
+LABELS = {"starting": "启动中", "running": "运行中", "external": "外部运行",
+          "unhealthy": "健康异常", "offline": "断线", "stopped": "已停止",
+          "stopping": "停止中", "restarting": "恢复中", "waiting": "等待依赖",
+          "backoff": "退避等待", "updating": "等待自行重启"}
+
+
+def targets(values: list[str] | None, *, reload: bool = False) -> list[str]:
+    result = list(dict.fromkeys(ALIASES.get(value, value) for value in values or ["all"]))
+    allowed = {"backend", "nonebot"} if reload else COMPONENTS
+    if "all" in result:
+        if len(result) > 1:
+            raise ValueError("all 不能和其他组件同时指定")
+        return sorted(allowed) if reload else ["all"]
+    unknown = set(result) - allowed
+    if unknown:
+        raise ValueError(f"不支持的组件：{'、'.join(sorted(unknown))}；可用：{'、'.join(sorted(allowed))}")
+    return result
+
+
+def launcher_settings(root: Path, reload_components: list[str] | None = None) -> dict[str, Any]:
+    config = configuration(root)
+    defaults: dict[str, Any] = {
+        "startup_timeout": 120, "health_interval": 10, "health_failures": 3,
+        "restart_backoff_initial": 1, "restart_backoff_max": 60, "stable_seconds": 60,
+        "shutdown_grace": 10, "poll_interval": 0.25, "reload_debounce": 0.6,
+        "goqbot_restart_grace": 120, "goqbot_offline_grace": 300,
+    }
+    values = config.get("launcher", {})
+    settings = {**defaults, **{key: values[key] for key in defaults if key in values}}
+    for key in defaults:
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < 86400:
+            raise ValueError(f"launcher.{key} 必须是大于 0 且小于 86400 的数值")
+    if not isinstance(settings["health_failures"], int):
+        raise ValueError("launcher.health_failures 必须是整数")
+    if settings["restart_backoff_max"] < settings["restart_backoff_initial"]:
+        raise ValueError("restart_backoff_max 不能小于 restart_backoff_initial")
+    watched = reload_components if reload_components is not None else values.get("reload", [])
+    if not isinstance(watched, list) or not all(isinstance(item, str) for item in watched):
+        raise ValueError("launcher.reload 必须是组件名称数组")
+    settings["reload_components"] = targets(watched, reload=True) if watched else []
+    return settings
+
+
+def probe(service: Service) -> dict[str, Any]:
+    """检查本组件全部健康入口；goqbot 只确认 OneBot 连接，不登录或更新 QQ。"""
+    checks = service.checks or ((service.health, service.health_service, service.health_kind),)
+    for url, expected, kind in checks:
+        if not url:
+            continue
+        try:
+            with LOCAL.open(url, timeout=1) as response:
+                if kind == "html":
+                    if response.status != 200 or response.headers.get_content_type() != "text/html":
+                        return {"ok": False, "reason": "网站未返回正常页面"}
+                    continue
+                body = json.loads(response.read(65536))
+                if not isinstance(body, dict):
+                    return {"ok": False, "reason": "健康响应格式不正确"}
+                if kind == "onebot":
+                    connected = body.get("connected")
+                    if type(connected) is not int or connected <= 0:
+                        return {"ok": False, "reason": "尚无 OneBot 连接"}
+                elif body.get("ok") is not True or body.get("service") != expected:
+                    return {"ok": False, "reason": f"{expected} 健康检查未通过"}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "reason": f"健康检查失败：{type(exc).__name__}"}
+    return {"ok": True, "reason": "健康检查通过"}
+
+
+async def run_managed(root: Path, services: list[Service], env: dict[str, str], settings: dict) -> int:
+    from launcher.control import ControlServer
+    from launcher.processes import find_goqbot, terminate
+    from launcher.supervisor import Supervisor
+    from launcher.watch import SourceWatcher
+
+    watcher = SourceWatcher(debounce=settings["reload_debounce"])
+    supervisor = Supervisor(
+        root, services, env, settings, start_fn=start,
+        stop_fn=lambda processes: stop(processes, grace=settings["shutdown_grace"]),
+        probe_fn=probe,
+        scan_fn=lambda service: find_goqbot(Path(service.command[0]), service.config_path),
+        stop_matches_fn=lambda matches: terminate(matches, grace=settings["shutdown_grace"]),
+        watcher_fn=watcher.changed,
+        echo=lambda message: print(message, flush=True),
+    )
+    loop = asyncio.get_running_loop()
+
+    def handle(payload: dict) -> dict:
+        options = {"enabled": payload["enabled"]} if "enabled" in payload else {}
+        future = asyncio.run_coroutine_threadsafe(
+            supervisor.command(payload["action"], payload.get("targets"), options), loop)
+        return future.result(timeout=30)
+
+    server = ControlServer(root, handle).start()
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    for sig in previous:
+        try:
+            loop.add_signal_handler(sig, supervisor.request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(supervisor.request_shutdown))
+    try:
+        print("运行监护已启用；另开终端用 uv run main.py status 查看，Ctrl+C 停止本次管理的服务。", flush=True)
+        await supervisor.run()
+        return 0
+    finally:
+        await asyncio.to_thread(server.close)
+        for sig, handler in previous.items():
             try:
-                process.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                process.wait(timeout=5)
-        return
-    for process in reversed(processes):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        for process in processes:
-            process.poll()
-        if not any(_group_alive(process.pid) for process in processes):
-            break
-        time.sleep(0.1)
-    for process in reversed(processes):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+            signal.signal(sig, handler)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="统一启动、持续监护与运行中组件管理")
+    result.add_argument("--check", action="store_true", help="只读检查，不启动、不创建运行文件")
+    result.add_argument("--reload", nargs="*", metavar="组件", help="监听组件源码；不填组件时为 backend")
+    sub = result.add_subparsers(dest="action")
+    for action, help_text in (("status", "查询运行中组件"), ("start", "启动已停止的组件及其依赖"),
+                              ("stop", "停止指定组件并保持停止"), ("restart", "重启指定组件")):
+        command = sub.add_parser(action, help=help_text)
+        command.add_argument("targets", nargs="*", metavar="组件", help="backend / nonebot / goqbot / web / all")
+        if action == "status":
+            command.add_argument("--json", action="store_true", help="输出机器可读状态")
+    reload_command = sub.add_parser("reload", help="切换 backend / nonebot 的源码自动重载")
+    reload_command.add_argument("targets", nargs="+", metavar="组件")
+    reload_command.add_argument("--off", action="store_true", help="关闭源码监听")
+    sub.add_parser("down", help="关闭监护及本次管理的组件")
+    sub.add_parser("check", help="与 --check 相同")
+    return result
+
+
+def print_states(result: dict) -> None:
+    rows = result.get("states", result.get("services", []))
+    print(f"{'组件':<12}{'状态':<10}{'进程':<9}{'重启':<7}{'源码监听':<10}说明")
+    for item in rows:
+        status = LABELS.get(item.get("status", ""), item.get("status", "未知"))
+        print(f"{item.get('key', ''):<12}{status:<10}{str(item.get('pid') or '—'):<9}"
+              f"{str(item.get('restarts', 0)):<7}{'开' if item.get('reload') else '关':<10}{item.get('message', '')}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reload", action="store_true", help="后端代码修改后自动重载")
-    parser.add_argument("--check", action="store_true", help="只检查目录、命令和端口，不启动服务")
-    args = parser.parse_args(argv)
-    processes = []
-    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    args = parser().parse_args(argv)
+    from launcher.control import ControlError, InstanceLock, request
 
-    def interrupted(*_):
-        # uv 与外层进程管理器可能重复投递停止信号；清理开始后不可再次打断。
-        for sig in previous:
-            signal.signal(sig, signal.SIG_IGN)
-        raise KeyboardInterrupt
-
-    for sig in previous:
-        signal.signal(sig, interrupted)
     try:
-        services, skipped = plan(ROOT, reload=args.reload)
+        if args.action not in (None, "check"):
+            if args.check or args.reload is not None:
+                raise ValueError("运行中管理命令请不要同时使用启动选项 --check/--reload")
+            action = args.action
+            selected = targets(getattr(args, "targets", None), reload=action == "reload")
+            payload: dict[str, Any] = {"action": action, "targets": selected}
+            if action == "reload":
+                payload["enabled"] = not args.off
+            result = request(ROOT, payload, timeout=35)
+            if getattr(args, "json", False):
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                if not result.get("ok", True):
+                    print(result.get("error") or result.get("message") or "管理请求失败。", file=sys.stderr)
+                elif action != "status":
+                    print(result.get("message") or "管理请求已受理，组件状态将按请求更新。")
+                print_states(result)
+            return 0 if result.get("ok", True) else 1
+
+        reload_components = (["backend"] if args.reload == [] else targets(args.reload, reload=True)) if args.reload is not None else None
+        settings = launcher_settings(ROOT, reload_components)
+        services, skipped = plan(ROOT)
         for message in skipped:
             print(message, flush=True)
-        env = child_environment(ROOT)
-        setup = next((s for s in services if s.config_path and not s.config_path.is_file()), None)
-        if setup:
-            print(f"goqbot 将在首次启动时生成 {setup.config_path.relative_to(ROOT)}。", flush=True)
-            if not args.check:
-                print("先由 goqbot 生成配置；填写完成后再次运行 uv run main.py 启动全部服务。", flush=True)
-                process = start(setup, env)
-                processes.append(process)
-                result = process.wait()
-                if result == 0 and not setup.config_path.is_file():
-                    raise RuntimeError("goqbot 已退出，但未生成配置文件，请检查程序版本和启动参数。")
-                return result
-        ensure_ports_free(services)
-        if args.check:
+        if args.check or args.action == "check":
+            ensure_ports_free(services)
             for service in services:
-                print(f"已检查 {service.name}：{service.cwd.relative_to(ROOT)}")
+                print(f"已检查 {service.key or service.name}：{service.cwd.relative_to(ROOT)}")
+                if service.config_path and not service.config_path.is_file():
+                    print(f"首次启动时生成 {service.config_path.relative_to(ROOT)}")
             return 0
-        prepare_web_dependencies(ROOT, services, env, processes)
-        timeout = float(configuration(ROOT).get("launcher", {}).get("startup_timeout", 120))
-        for service in services:
-            print(f"启动 {service.name}…", flush=True)
-            process = start(service, env)
-            processes.append(process)
-            wait_ready(service, process, timeout)
-            if any(p.poll() is not None for p in processes):
-                raise RuntimeError("有服务在启动期间退出，正在停止本次启动的全部服务。")
-        print("所有已配置组件已启动，按 Ctrl+C 停止。", flush=True)
-        while all(p.poll() is None for p in processes):
-            time.sleep(0.3)
-        raise RuntimeError("有服务退出，正在停止本次启动的全部服务。")
+        with InstanceLock(ROOT):
+            env = child_environment(ROOT)
+            # 原生程序负责首次生成配置；此路径不安装网站依赖，也不要求业务端口空闲。
+            setup = next((s for s in services if s.config_path and not s.config_path.is_file()), None)
+            temporary: list[subprocess.Popen] = []
+            previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+            def interrupted(*_):
+                for sig in previous:
+                    signal.signal(sig, signal.SIG_IGN)
+                raise KeyboardInterrupt
+
+            for sig in previous:
+                signal.signal(sig, interrupted)
+            try:
+                if setup:
+                    print(f"goqbot 将生成 {setup.config_path.relative_to(ROOT)}；填写后重新启动项目。", flush=True)
+                    process = start(setup, env)
+                    temporary.append(process)
+                    result = process.wait()
+                    if result == 0 and not setup.config_path.is_file():
+                        raise RuntimeError("goqbot 已退出但未生成配置，请检查其版本与参数。")
+                    return result
+                ensure_ports_free(services)
+                prepare_web_dependencies(ROOT, services, env, temporary)
+                return asyncio.run(run_managed(ROOT, services, env, settings))
+            finally:
+                for sig in previous:
+                    signal.signal(sig, signal.SIG_IGN)
+                try:
+                    stop(temporary)
+                finally:
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)
     except KeyboardInterrupt:
-        print("正在停止本次启动的全部服务…", flush=True)
+        print("已停止本次启动。", flush=True)
         return 0
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"启动失败：{exc}", file=sys.stderr, flush=True)
+    except (OSError, RuntimeError, ValueError, ControlError) as exc:
+        print(f"运行管理失败：{exc}", file=sys.stderr, flush=True)
         return 1
-    finally:
-        for sig in previous:
-            signal.signal(sig, signal.SIG_IGN)
-        try:
-            stop(processes)
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

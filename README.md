@@ -13,6 +13,7 @@ avalon-RPG/
 │   ├── app.py              # uv run app.py
 │   ├── .env / .env.example # 后端配置
 │   ├── api/ / logic/ / contracts/
+│   ├── launcher/           # 组件监督、源码监听、本机管理与安全进程识别
 │   └── tests/ / docs/
 ├── bot/
 │   ├── nonebot/            # uv run bot.py；配置为 .env.dev 或 .env.prod
@@ -31,14 +32,53 @@ avalon-RPG/
 uv run main.py
 ```
 
-入口依次启动后端、NoneBot、goqbot 和 Vue。首次运行、前端依赖文件变化或 `web/node_modules` 缺失时，
+入口按依赖启动后端 → NoneBot → goqbot，Vue 等待后端就绪；随后持续监督各组件。
+后端、NoneBot 或 Vue 异常退出或连续健康检查失败时，只恢复对应组件，并逐步延长重试间隔。
+首次运行、前端依赖文件变化或 `web/node_modules` 缺失时，
 会先执行 `npm ci` 安装锁定依赖；安装失败时不启动服务。Vue 默认使用 `http://127.0.0.1:5173`，
 端口被占用时直接报错，不自动切换端口，统一入口会等待页面就绪。
 
 若 `bot/goqbot/config/config.yml` 不存在，首次执行只启动原生 goqbot 生成配置；
 此时不启动其他服务，也不要求旧服务端口空闲。填写生成的配置后再次执行上述命令。
 `uv run main.py --check` 只检查，不生成配置或安装前端依赖。
-Ctrl+C 或服务异常退出会停止本次启动的整组进程；启动器不会接管或停止其他实例。
+
+## 运行中管理
+
+保持上述根启动器运行，在另一个终端进入同一项目根目录执行：
+
+| 命令 | 作用 |
+| --- | --- |
+| `uv run main.py status` | 查看全部已配置组件 |
+| `uv run main.py status backend goqbot --json` | 仅查询指定组件，以 JSON 输出 |
+| `uv run main.py start goqbot` | 启动 goqbot，并递归启动其需要的 NoneBot、后端 |
+| `uv run main.py restart backend` | 只重启后端组件（API 与 Logic 一起）；不重启其他组件 |
+| `uv run main.py stop nonebot` | 只停 NoneBot，并保持手动停止状态，不被自动拉起 |
+| `uv run main.py start all` | 恢复全部已配置组件及其依赖 |
+| `uv run main.py reload backend nonebot` | 开启这两个组件的源码监听，变更后分别重载 |
+| `uv run main.py reload backend nonebot --off` | 关闭源码监听 |
+| `uv run main.py down` | 退出根启动器并清理本次拥有的进程，与 Ctrl+C 相同 |
+
+组件名为 `backend`（API + Logic）、`nonebot`、`goqbot`、`web`；查询和启停命令可指定多个组件或 `all`。
+只有 `start` 会递归恢复依赖；`restart`、`stop` 只作用于指定目标，不撤销其他组件的手动停止状态。
+例如先 `stop backend` 再 `restart nonebot`，NoneBot 会等待后端，需明确 `start backend` 才会恢复。
+管理命令需要已有根启动器；不会隐式启动另一整套项目。运行中可反复用 `status` 查看操作是否完成。
+
+也可在根启动时开启监听：`uv run main.py --reload backend nonebot`；单独写 `--reload` 默认仅监听后端。
+Vue 使用 Vite 自己的 HMR；goqbot 自行管理更新，不加入 Python 源码监听。
+`.env`、环境选择、端口和根 `avalon.toml` 的变更需要正常停止并重新运行根入口，不能靠源码重载更新启动计划。
+
+根启动器使用 `data/run/launcher.lock` 保证同一项目只有一个实例，通过本机回环地址与临时凭据接收管理命令；
+连接记录位于 `data/run/launcher.json`，不提交 Git，也不是业务配置。运行依赖（包括 psutil）属于根 uv 项目。
+升级前已经运行的旧根进程不会自动获得新管理接口：先在原终端正常停止，再执行 `uv run main.py`。
+独立启动的后端和 NoneBot 不会被接管；它们占用所需端口时，新根入口会报错。
+
+对于 goqbot，启动器精确核对当前用户、运行程序、`-config` 路径以及 PID/创建时间；权限不足、参数不明或多个匹配时暂停自动拉起。
+程序自行更新后若脱离原父进程，会识别并跟随接替进程；运行副本不会被启动器覆盖。
+进程消失先等待默认 120 秒自行重启，再确认不存在后重试；进程仍在但 OneBot 断线时等待默认 300 秒，之后只提示离线，不杀进程。
+启动时已存在的匹配 goqbot 仅附着观察，Ctrl+C/`down` 不清理它；显式 `stop goqbot` 或 `restart goqbot` 才会停止该实例。
+详细边界见 [goqbot 说明](bot/goqbot/README.md)。
+
+## 独立启动与环境
 
 各组件也可独立启动：
 
@@ -101,15 +141,19 @@ Unix 系统需授予执行权限。配置由原生程序生成，项目不保存
 
 ## 验证
 
+以下数量和实机联调记录属于完整迁移阶段，不代表后来每次启动管理改动的最新测试总数。
+启动器运行依赖在根项目；后端开发环境保留测试工具，后续恢复或编写本地测试后可用于回归。
+项目自有的 `test_` 开头测试程序已删除；`test_*`、`tests/` 和 `conftest.py` 均由 Git 忽略，测试程序不随仓库提交。
+
 迁移快照中的四个业务 SQLite 数据库及模拟任务库已通过完整性校验。测试使用隔离环境，未连接真实 QQ 或发送聊天消息。
 当前数据包含真实玩家和网站账号，测试配置与正式接入配置分开使用。
-本轮后端与启动器回归为 264 项通过、35 项旧引擎对拍跳过；Ruff 检查通过。
+完整迁移阶段后端与启动器回归为 264 项通过、35 项旧引擎对拍跳过；Ruff 检查通过。
 Vue 依赖安装和生产构建完成，根入口 `--check` 已通过四个组件检查。
 完整隔离联调已验证根入口启动、网站及静态资源、API 代理、合成账号登录与 CSRF 校验；Ctrl+C 后全部测试端口释放。
 QQ 上游保持关闭，合成账号只写入临时测试副本。本机验收报告位于 `data/migrations/full-migration-smoke-20261125-031901.json`。
 
 ```sh
-# 从项目根目录运行
+# 以下 pytest 命令需先恢复或编写本地测试，再从项目根目录运行
 uv run --project servers --locked pytest servers -q
 uv run --project bot/nonebot --locked pytest bot/nonebot/tests -q
 

@@ -10,7 +10,6 @@ from pathlib import Path
 from avalon_contracts.envfile import find_root, load_env
 
 LOGIC_URL = "http://127.0.0.1:7901"
-CTL_URL = "http://127.0.0.1:7902"
 PLACEHOLDER_PREFIX = "请改成"
 
 

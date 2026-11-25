@@ -1,0 +1,29 @@
+-- 仅供手动配置网站账号，不涉及玩家数据。执行前复制到 sql/local/ 下修改，该目录不提交 Git。
+-- 在项目根目录先执行 uv run --project servers --locked avalon-api-migrate，目标数据库只能是 data/api.db。
+-- 哈希工具：uv run --project servers --locked python -m avalon_api.auth.passwords（仅生成哈希，不连接数据库）
+-- 执行：sqlite3 -bail data/api.db < sql/local/website-user.local.sql
+-- SQL 字符串中的单引号要写为两个单引号。不要把密码明文写进 SQL。
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE website_account_input (
+    username TEXT NOT NULL CHECK (
+        length(trim(username)) BETWEEN 1 AND 64
+        AND username = trim(username)
+    ),
+    password_hash TEXT NOT NULL CHECK (
+        password_hash GLOB 'pbkdf2_sha256$600000$*' AND length(password_hash) = 90
+    ),
+    role TEXT NOT NULL CHECK (role IN ('viewer', 'editor', 'admin', 'super'))
+);
+
+-- 首个账号应为 super；其他账号按需要选择 viewer / editor / admin / super。
+-- 只填写下一行 VALUES：第一个空字符串填账号，第二个填完整密码哈希。
+-- 不需要修改上面的 CHECK 约束；任意一项留空都会拒绝插入。
+INSERT INTO website_account_input (username, password_hash, role)
+VALUES ('', '', 'super');
+
+INSERT INTO admin_users (username, password_hash, role, disabled, created_at, last_login_at)
+SELECT username, password_hash, role, 0, strftime('%Y-%m-%d %H:%M:%f+00:00', 'now'), NULL
+FROM website_account_input;
+
+DROP TABLE website_account_input;
+COMMIT;

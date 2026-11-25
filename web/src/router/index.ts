@@ -20,13 +20,13 @@ const router = createRouter({
         { path: 'prop-recipes', component: () => import('@/views/rules/RulesManageView.vue'), props: { category: 'prop_recipes' }, meta: { title: '道具配方' } },
         { path: 'stacks', component: () => import('@/views/rules/RulesManageView.vue'), props: { category: 'stacks' }, meta: { title: '层数管理' } },
         { path: 'users', component: () => import('@/views/users/UsersView.vue'), meta: { title: '网站用户', superOnly: true } },
-        { path: 'stats', component: () => import('@/views/stats/StatsView.vue'), meta: { title: '统计流水' } },
+        { path: 'stats', redirect: { path: '/dashboard', hash: '#statistics' } },
         { path: 'settings', component: () => import('@/views/settings/SettingsView.vue'), meta: { title: '年卡设定' } },
         { path: '', redirect: '/dashboard' },
         {
           path: 'dashboard',
           component: () => import('@/views/dashboard/DashboardView.vue'),
-          meta: { title: '数据大屏' },
+          meta: { title: '运行概览' },
         },
         {
           path: 'items/:id?',
@@ -40,8 +40,7 @@ const router = createRouter({
         },
         {
           path: 'system',
-          component: () => import('@/views/system/SystemView.vue'),
-          meta: { title: '系统状态' },
+          redirect: { path: '/dashboard', hash: '#system' },
         },
       ],
     },

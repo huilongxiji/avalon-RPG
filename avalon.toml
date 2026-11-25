@@ -2,6 +2,19 @@
 # 后端配置在 servers/.env；NoneBot 配置在 bot/nonebot/.env.<ENVIRONMENT>。
 [launcher]
 startup_timeout = 120
+# 连续健康失败达到阈值后恢复；稳定运行一段时间才重置退避，避免崩溃循环。
+health_interval = 10
+health_failures = 3
+restart_backoff_initial = 1
+restart_backoff_max = 60
+stable_seconds = 60
+shutdown_grace = 10
+# goqbot 自行下载、同步并重启；等待其接替进程，只有确认进程消失超时才补启动。
+goqbot_restart_grace = 120
+goqbot_offline_grace = 300
+# 只监听 backend / nonebot 源码；Vue 使用 Vite HMR，goqbot 自行更新。
+reload = []
+reload_debounce = 0.6
 
 [goqbot]
 # 使用者自行放入对应操作系统和 CPU 架构的程序，程序文件不提交 Git。

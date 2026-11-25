@@ -4,7 +4,7 @@ name = "avalon-rpg"
 version = "0.1.0"
 description = "阿瓦隆 RPG 统一启动入口"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = ["psutil>=7.2.2,<8"]
 
 [tool.uv]
 package = false

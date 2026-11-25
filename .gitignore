@@ -45,5 +45,7 @@ node_modules/
 .idea/*
 !.idea/dictionaries/
 
-# 本地测试脚本不提交 Git（匹配所有目录下 test_ 开头的名称）
+# 测试程序及辅助文件不提交 Git（匹配所有层级）
 test_*
+tests/
+conftest.py

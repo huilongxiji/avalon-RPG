@@ -1,13 +1,13 @@
-"""系统状态：各服务是否在运行（网站右上角和"系统状态"页使用）。
+"""运行概览：实际健康检查和 OneBot 连接状态。
 
 网站会话可读取；健康摘要兼容机器人与模拟器的服务令牌。
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-import httpx
 from avalon_contracts.api.system import ServiceState
 from avalon_contracts.common import ApiResponse
 from avalon_contracts.errors import GameError
@@ -15,8 +15,8 @@ from fastapi import APIRouter, Depends, Request
 
 from ...auth.service import _current_token
 from ...auth.web import COOKIE_NAME, current_user
-from ...config import CTL_URL
 from ...logic_client import logic
+from ...service_status import PROBE_TIMEOUT, service_states
 
 router = APIRouter(prefix="/api/v1/system", tags=["系统"])
 
@@ -34,7 +34,8 @@ async def health_access(request: Request):
 async def system_health() -> ApiResponse[dict[str, Any]]:
     result: dict[str, Any] = {"api": True}
     try:
-        result["logic"] = await logic().get("/health")
+        async with asyncio.timeout(PROBE_TIMEOUT):
+            result["logic"] = await logic().get("/health", timeout=PROBE_TIMEOUT)
     except Exception:  # noqa: BLE001
         result["logic"] = None
     return ApiResponse.success(result)
@@ -42,13 +43,5 @@ async def system_health() -> ApiResponse[dict[str, Any]]:
 
 @router.get("/services", response_model=ApiResponse[list[ServiceState]], dependencies=[Depends(current_user)])
 async def services() -> ApiResponse[list[ServiceState]]:
-    """来自编排程序的状态接口；编排程序没在运行时返回空列表并说明原因。"""
-    url = CTL_URL + "/status"
-    try:
-        async with httpx.AsyncClient(timeout=3) as http:
-            resp = await http.get(url)
-            resp.raise_for_status()
-            states = [ServiceState.model_validate(s) for s in resp.json()]
-    except Exception:  # noqa: BLE001
-        return ApiResponse(ok=True, data=[], error=None)
-    return ApiResponse.success(states)
+    """探测实际服务；不依赖根入口提供额外编排接口。"""
+    return ApiResponse.success(await service_states())
