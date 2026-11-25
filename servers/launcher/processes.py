@@ -10,6 +10,7 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,62 +128,104 @@ def _config_argument(arguments: list[str]) -> tuple[str | None, bool]:
     return (values[0] if len(values) == 1 else None), malformed or len(values) > 1
 
 
+def _scan_read[T](read: Callable[[], T]) -> T | None:
+    """元数据不可读不等于候选；调用者按已知路径/名称决定是否需要阻止启动。"""
+    try:
+        return read()
+    except _GONE:
+        raise
+    except (*_DENIED, OSError, ValueError):
+        return None
+
+
 def find_goqbot(executable: Path, config: Path) -> ScanResult:
     """只匹配当前用户的精确程序和精确 -config 参数，不读取配置内容。
 
-    argv[1] 允许 Python/脚本解释器运行临时测试程序。无法读取潜在候选的
-    必要信息时返回 uncertain，调用者不能因此假定没有实例而再启动一个。
+    argv[1] 允许 Python/脚本解释器运行临时测试程序。只有存在目标程序的
+    路径/名称证据时，读取受限才返回 uncertain；名称永远不用于确认身份。
+    Linux 内核线程的空 exe/cmdline，以及完全不可读且无候选证据的进程，
+    不阻塞整张进程表。进程表本身不可读仍阻止启动。
     """
-    wanted_exe, wanted_config = _path(str(executable), str(Path.cwd())), _path(str(config), str(Path.cwd()))
+    wanted_exe = _path(str(executable), str(Path.cwd()))
+    wanted_config = _path(str(config), str(Path.cwd()))
+    wanted_names = {os.path.normcase(executable.name), Path(wanted_exe).name}
+    process_names = set(wanted_names)
+    if psutil.LINUX:
+        # Linux comm 最多 15 字节；仅作为权限不足时的保守候选提示。
+        process_names.update(name.encode()[:15].decode(errors="ignore") for name in wanted_names)
     matches: set[ProcessIdentity] = set()
     uncertain = False
     missing_config = False
     try:
         for process in _processes():
+            candidate = False
             try:
-                if not _same_user(process):
+                same_user = _scan_read(lambda process=process: _same_user(process))
+                if same_user is False:
                     continue
-                if process.status() == psutil.STATUS_ZOMBIE:
+                # 在读取程序/参数之前记住创建时间，避免扫描途中 PID 被复用。
+                created = _scan_read(process.create_time)
+                if _scan_read(process.status) == psutil.STATUS_ZOMBIE:
                     continue
-                created = process.create_time()
-                try:
-                    executable_path = process.exe()
-                except _DENIED:
-                    executable_path = None
-                try:
-                    arguments = process.cmdline()
-                except _DENIED:
-                    # 路径已经明确不同且不存在脚本参数仍不能排除解释器候选。
-                    uncertain = True
-                    continue
-                if not arguments:
-                    uncertain = True
+                executable_path = _scan_read(process.exe)
+                arguments = _scan_read(process.cmdline)
+                if executable_path == "" and arguments == []:
+                    # Linux root 会看到没有用户态程序和参数的内核线程。
                     continue
                 paths = ([executable_path] if executable_path else []) + [
-                    arg for arg in arguments[:2] if arg and not arg.startswith("-")
+                    arg for arg in (arguments or [])[:2] if arg and not arg.startswith("-")
                 ]
-                config_arg, ambiguous = _config_argument(arguments)
-                # 绝对程序路径不需要读取 cwd；相对 argv 和相对配置需要它。
+                absolute_paths = [path for path in paths if Path(path).is_absolute()]
+                resolved = [_scan_read(lambda path=path: _path(path, None)) for path in absolute_paths]
+                program_matches = wanted_exe in resolved
+                candidate = any(
+                    value is None and os.path.normcase(Path(path).name) in wanted_names
+                    for path, value in zip(absolute_paths, resolved, strict=True)
+                )
                 cwd = None
-                if any(not Path(path).is_absolute() for path in paths) or (
-                    config_arg is not None and not Path(config_arg).is_absolute()
-                ):
-                    try:
-                        cwd = process.cwd()
-                    except _DENIED:
-                        # 已知的绝对路径不匹配时，相对参数仍可能是目标程序。
-                        uncertain = True
-                        continue
-                if wanted_exe not in {_path(path, cwd) for path in paths}:
-                    uncertain = uncertain or executable_path is None
+                cwd_read = False
+                if not program_matches:
+                    relative_paths = [path for path in paths if not Path(path).is_absolute()]
+                    if relative_paths:
+                        cwd = _scan_read(process.cwd) or None
+                        cwd_read = True
+                        resolved = [_scan_read(lambda path=path, cwd=cwd: _path(path, cwd)) for path in relative_paths]
+                        program_matches = wanted_exe in resolved
+                        candidate = candidate or any(
+                            value is None and os.path.normcase(Path(path).name) in wanted_names
+                            for path, value in zip(relative_paths, resolved, strict=True)
+                        )
+                if not program_matches and (not executable_path or not arguments):
+                    # 名称只用于无法核实路径/参数时的提示，不把其他守护进程的
+                    # AccessDenied 提升为全局错误，也不凭名称附着/结束进程。
+                    name = _scan_read(process.name)
+                    candidate = candidate or (
+                        name is not None and os.path.normcase(name) in process_names
+                    )
+                candidate = candidate or program_matches
+                if not candidate:
                     continue
+                if arguments is None:
+                    uncertain = True
+                    continue
+                config_arg, ambiguous = _config_argument(arguments)
                 if ambiguous:
                     uncertain = True
                     continue
                 if config_arg is None:
-                    uncertain = missing_config = True
+                    uncertain = True
+                    missing_config = missing_config or program_matches
                     continue
-                if _path(config_arg, cwd) != wanted_config:
+                if not Path(config_arg).is_absolute() and not cwd_read:
+                    cwd = _scan_read(process.cwd) or None
+                actual_config = _scan_read(lambda config_arg=config_arg, cwd=cwd: _path(config_arg, cwd))
+                if actual_config is None:
+                    uncertain = True
+                    continue
+                if actual_config != wanted_config:
+                    continue
+                if not program_matches or same_user is None or created is None:
+                    uncertain = True
                     continue
                 value = ProcessIdentity(process.pid, created)
                 if _verified(value) is not None:
@@ -190,10 +233,10 @@ def find_goqbot(executable: Path, config: Path) -> ScanResult:
             except _GONE:
                 continue
             except (*_DENIED, OSError, ValueError):
-                uncertain = True
+                uncertain = uncertain or candidate
     except (*_DENIED, OSError):
         uncertain = True
-    message = "部分进程信息无法读取或配置参数有歧义，不能确认是否存在其他实例" if uncertain else ""
+    message = "部分候选进程信息无法读取或配置参数有歧义，不能确认是否存在其他实例" if uncertain else ""
     if missing_config:
         message = "发现程序路径匹配但缺少 -config 参数的进程，无法确认配置归属；不会重复启动"
     return ScanResult(sorted(matches, key=lambda item: item.pid), uncertain, message)

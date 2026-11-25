@@ -70,6 +70,7 @@ class Supervisor:
         self.identity_fn, self.refresh_group_fn = identity_fn, refresh_group_fn
         self.clock = clock
         self.echo = echo
+        self.output_error: str | None = None
         self._observed: dict[str, tuple[Any, ...]] = {}
         self.started = asyncio.Event()
         self.stopping = asyncio.Event()
@@ -255,7 +256,15 @@ class Supervisor:
         labels = {"starting": "等待就绪", "running": "运行中", "external": "附着已有进程",
                   "stopped": "已停止", "restarting": "等待重启", "unhealthy": "需要检查", "offline": "连接离线"}
         pid = f"（PID {state['pid']}）" if state['pid'] is not None else ""
-        self.echo(f"[{state['name']}] {labels.get(state['status'], state['status'])}{pid}：{state['reason']}")
+        try:
+            self.echo(f"[{state['name']}] {labels.get(state['status'], state['status'])}{pid}：{state['reason']}")
+        except (OSError, ValueError) as exc:
+            # SSH/terminal loss can close the fd (OSError) or TextIO stream
+            # (ValueError). Logging must not stop a worker or skip cleanup.
+            # Do not fall back to stderr: it may be the same closed terminal.
+            self.output_error = f"{type(exc).__name__}: {exc}"
+        else:
+            self.output_error = None
 
     async def tick(self, key: str) -> None:
         """One deterministic supervision step; public for isolated state tests."""

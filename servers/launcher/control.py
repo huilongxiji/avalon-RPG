@@ -17,7 +17,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 from urllib.parse import parse_qs, urlencode
 
 PROTOCOL_VERSION = 1
@@ -28,6 +28,7 @@ MAX_RESPONSE = 1024 * 1024
 READ_TIMEOUT = 3.0
 ACTIONS = frozenset({"status", "start", "stop", "restart", "reload", "down"})
 TARGETS = frozenset({"backend", "nonebot", "goqbot", "web", "all"})
+IDENTITY_FIELDS = ("protocol", "root", "pid", "created_at", "instance_id")
 
 
 class ControlError(RuntimeError):
@@ -133,7 +134,7 @@ class InstanceLock:
 def _read_manifest(root: Path) -> dict[str, Any]:
     path = root / "data" / "run" / MANIFEST_NAME
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BODY:
@@ -164,6 +165,130 @@ def _read_manifest(root: Path) -> dict[str, Any]:
     if not valid:
         raise ControlError("启动器运行记录不属于本项目或协议无效；不会连接其他服务")
     return value
+
+
+def _manifest_if_present(root: Path) -> dict[str, Any] | None:
+    try:
+        return _read_manifest(root)
+    except ControlError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return None
+        raise
+
+
+def _exit_path(root: Path, instance_id: str) -> Path:
+    return root / "data" / "run" / f"launcher-{instance_id}.exit.json"
+
+
+def _exit_result(root: Path, instance_id: str, *, stale_manifest: bool = False) -> dict:
+    """仅在确认原实例已释放锁后读取；不把退出等同于组件清理成功。"""
+    result = {"stopped": True, "instance_id": instance_id}
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(_exit_path(root, instance_id), flags)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BODY
+                    or (os.name != "nt" and info.st_mode & 0o077)):
+                raise ValueError
+            value = json.loads(stream.read(MAX_BODY + 1))
+        finished = value.get("finished_at") if isinstance(value, dict) else None
+        valid = (isinstance(value, dict)
+                 and set(value) == {"protocol", "root", "instance_id", "finished_at", "ok", "error"}
+                 and type(value["protocol"]) is int and value["protocol"] == PROTOCOL_VERSION
+                 and value["root"] == str(root) and value["instance_id"] == instance_id
+                 and type(finished) in (int, float) and math.isfinite(finished)
+                 and 0 < finished <= time.time() + 60
+                 and type(value["ok"]) is bool
+                 and isinstance(value["error"], str)
+                 and value["ok"] == (value["error"] == ""))
+        if not valid:
+            raise ValueError
+    except FileNotFoundError:
+        return {**result, "ok": False, "error": "启动器已退出，但无法确认组件清理结果（退出回执缺失，请检查运行日志）"}
+    except (OSError, ValueError, UnicodeError):
+        return {**result, "ok": False, "error": "启动器已退出，但无法确认组件清理结果（退出回执不可读或无效，请检查运行目录权限及日志）"}
+    if not value["ok"]:
+        return {**result, "ok": False, "error": "启动器已退出，但组件清理失败：" + value["error"]}
+    if stale_manifest:
+        return {**result, "ok": False, "error": "启动器已退出，但运行记录仍残留，无法确认收尾完成；请检查运行目录权限及日志"}
+    return {**result, "ok": True, "message": "启动器已退出，本次管理的组件已完成停止清理。"}
+
+
+def _probe_instance_lock(root: Path) -> BinaryIO | None:
+    """非创建式探测；返回仍持有锁的流，避免读记录时新实例抢入。"""
+    path = root / "data" / "run" / "launcher.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        stream = os.fdopen(fd, "r+b", buffering=0)
+    except OSError as exc:
+        raise ControlError("无法确认启动器退出：实例锁文件缺失或不可访问，请检查 data/run 权限") from exc
+    try:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ControlError("无法确认启动器退出：实例锁不是普通文件")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if info.st_size == 0:
+                    raise ControlError("无法确认启动器退出：实例锁文件无效")
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                stream.close()
+                return None
+            raise
+        current = path.stat(follow_symlinks=False)
+        if (not stat.S_ISREG(current.st_mode)
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise ControlError("无法确认启动器退出：实例锁文件已被替换")
+        return stream
+    except OSError as exc:
+        stream.close()
+        raise ControlError("无法确认启动器退出：实例锁状态不可读取") from exc
+    except BaseException:
+        stream.close()
+        raise
+
+
+def wait_stopped(root: Path, expected_instance_id: str, timeout: float = 90.0) -> dict:
+    """只读等待已认证 down 对应实例退出，不等待后来启动的新实例。
+
+    不创建/删除运行文件、不终止进程。正常退出仍须有成功回执；旧版本或
+    异常崩溃没有回执时仅确认启动器退出，不宣称其子进程已清理。
+    """
+    root = _root(root)
+    if (not isinstance(expected_instance_id, str) or len(expected_instance_id) != 32
+            or any(c not in "0123456789abcdef" for c in expected_instance_id)):
+        raise ControlError("无法确认启动器退出：缺少有效的原实例标识")
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ControlError("等待退出超时必须为正数")
+    deadline = time.monotonic() + timeout
+    while True:
+        stream = _probe_instance_lock(root)
+        if stream is not None:
+            with stream:
+                manifest = _manifest_if_present(root)
+                stale = manifest is not None and manifest["instance_id"] == expected_instance_id
+                return _exit_result(root, expected_instance_id, stale_manifest=stale)
+        manifest = _manifest_if_present(root)
+        if manifest is not None and manifest["instance_id"] != expected_instance_id:
+            try:
+                # 新实例认证成功意味着原实例已交出同一项目的实例锁。
+                _handshake(manifest, timeout=max(.01, min(1.0, deadline - time.monotonic())))
+            except ControlError as exc:
+                if not isinstance(exc.__cause__, (OSError, http.client.HTTPException)):
+                    raise
+            else:
+                return _exit_result(root, expected_instance_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ControlError("等待启动器退出超时；尚未确认原启动器退出及组件清理完成，请检查运行日志")
+        time.sleep(min(.1, remaining))
 
 
 class _HeaderReader:
@@ -400,27 +525,100 @@ class ControlServer:
         except ControlError:
             pass
 
-    def close(self) -> None:
+    def _write_exit(self, error: str | None) -> None:
+        path = _exit_path(self.root, self.instance_id)
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        message = "" if error is None else (str(error) or "组件清理未完成")
+        message = message.replace(self._secret, "[redacted]")[:1000]
+        value = {"protocol": PROTOCOL_VERSION, "root": str(self.root),
+                 "instance_id": self.instance_id, "finished_at": time.time(),
+                 "ok": error is None, "error": message}
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def close(self, *, error: str | None = None) -> None:
         server, self._server = self._server, None
         if server is None:
             return
         with self._condition:
             self._closing = True
-        server.shutdown()
-        deadline = time.monotonic() + 1.0
-        with self._condition:
-            while self._inflight and (left := deadline - time.monotonic()) > 0:
-                self._condition.wait(left)
-        server.server_close()
+        failures: list[BaseException] = []
+
+        def attempt(operation):
+            try:
+                operation()
+            except BaseException as exc:
+                failures.append(exc)
+
+        attempt(server.shutdown)
+        try:
+            deadline = time.monotonic() + 1.0
+            with self._condition:
+                while self._inflight and (left := deadline - time.monotonic()) > 0:
+                    self._condition.wait(left)
+        except BaseException as exc:
+            failures.append(exc)
+        # 每一步均尝试，回执写入或权限失败不能跳过控制端口和 manifest 收尾。
+        attempt(server.server_close)
         if self._thread is not threading.current_thread():
-            self._thread.join(timeout=1)
-        self._remove_manifest()
+            attempt(lambda: self._thread.join(timeout=1))
+        exit_error = error
+        if failures:
+            exit_error = (error + "；" if error else "") + "控制接口关闭失败，请检查运行日志"
+        attempt(lambda: self._write_exit(exit_error))
+        attempt(self._remove_manifest)
+        if failures:
+            raise ControlError("启动器控制接口收尾失败，无法确认完整清理；请检查运行目录权限及日志") from failures[0]
 
     def __enter__(self) -> ControlServer:
         return self.start()
 
-    def __exit__(self, *_: Any) -> None:
-        self.close()
+    def __exit__(self, _type, error, _traceback) -> None:
+        self.close(error=None if error is None else str(error) or type(error).__name__)
+
+
+def _exchange(manifest: dict, method: str, path: str, *, timeout: float,
+              body: bytes | None = None) -> dict:
+    headers = {"Host": f"127.0.0.1:{manifest['port']}",
+               "Authorization": "Bearer " + manifest["secret"],
+               "X-Avalon-Instance": manifest["instance_id"]}
+    connection = http.client.HTTPConnection("127.0.0.1", manifest["port"], timeout=timeout)
+    try:
+        connection.request(method, path, body, {**headers, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        data = response.read(MAX_RESPONSE + 1)
+        if len(data) > MAX_RESPONSE:
+            raise ControlError("启动器响应过大")
+        try:
+            result = json.loads(data)
+        except (ValueError, UnicodeError) as exc:
+            raise ControlError("启动器响应格式不正确；不会接管其他服务") from exc
+        if not isinstance(result, dict):
+            raise ControlError("启动器响应格式不正确")
+        if response.status != 200:
+            message = result.get("error")
+            if not isinstance(message, str):
+                message = "启动器拒绝了控制请求"
+            raise ControlError(message.replace(manifest["secret"], "[redacted]"))
+        return result
+    except (OSError, http.client.HTTPException) as exc:
+        raise ControlError("无法连接本项目启动器，运行记录可能已过期；不会接管或停止其他服务") from exc
+    finally:
+        connection.close()
+
+
+def _handshake(manifest: dict, timeout: float) -> None:
+    identity = _exchange(manifest, "GET", "/v1/handshake", timeout=timeout)
+    if any(identity.get(key) != manifest[key] for key in IDENTITY_FIELDS):
+        raise ControlError("启动器握手不匹配，运行记录已过期；请重新执行命令")
 
 
 def request(root: Path, payload: dict, timeout: float = 5.0) -> dict:
@@ -429,40 +627,12 @@ def request(root: Path, payload: dict, timeout: float = 5.0) -> dict:
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
         raise ControlError("控制请求超时必须为正数")
     manifest = _read_manifest(root)
-    headers = {"Host": f"127.0.0.1:{manifest['port']}",
-               "Authorization": "Bearer " + manifest["secret"],
-               "X-Avalon-Instance": manifest["instance_id"]}
-
-    def exchange(method: str, path: str, body: bytes | None = None) -> dict:
-        connection = http.client.HTTPConnection("127.0.0.1", manifest["port"], timeout=timeout)
-        try:
-            connection.request(method, path, body, {**headers, "Content-Type": "application/json"})
-            response = connection.getresponse()
-            data = response.read(MAX_RESPONSE + 1)
-            if len(data) > MAX_RESPONSE:
-                raise ControlError("启动器响应过大")
-            try:
-                result = json.loads(data)
-            except (ValueError, UnicodeError) as exc:
-                raise ControlError("启动器响应格式不正确；不会接管其他服务") from exc
-            if not isinstance(result, dict):
-                raise ControlError("启动器响应格式不正确")
-            if response.status != 200:
-                message = result.get("error")
-                if not isinstance(message, str):
-                    message = "启动器拒绝了控制请求"
-                raise ControlError(message.replace(manifest["secret"], "[redacted]"))
-            return result
-        except (OSError, http.client.HTTPException) as exc:
-            raise ControlError("无法连接本项目启动器，运行记录可能已过期；不会接管或停止其他服务") from exc
-        finally:
-            connection.close()
-
-    identity = exchange("GET", "/v1/handshake")
-    if any(identity.get(key) != manifest[key] for key in
-           ("protocol", "root", "pid", "created_at", "instance_id")):
-        raise ControlError("启动器握手不匹配，运行记录已过期；请重新执行命令")
+    _handshake(manifest, timeout)
     if payload["action"] == "status":
         query = urlencode([("target", target) for target in payload["targets"]])
-        return exchange("GET", "/v1/status" + ("?" + query if query else ""))
-    return exchange("POST", "/v1/action", json.dumps(payload).encode("utf-8"))
+        return _exchange(manifest, "GET", "/v1/status" + ("?" + query if query else ""), timeout=timeout)
+    result = _exchange(manifest, "POST", "/v1/action", timeout=timeout,
+                       body=json.dumps(payload).encode("utf-8"))
+    if payload["action"] == "down":
+        result = {**result, "instance_id": manifest["instance_id"]}
+    return result

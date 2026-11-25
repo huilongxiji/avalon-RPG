@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -18,6 +19,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +28,41 @@ os.environ["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 if str(ROOT / "servers") not in sys.path:
     sys.path.insert(0, str(ROOT / "servers"))
+
+
+def output(*args: Any, **kwargs: Any) -> None:
+    """SSH 终端已关闭时，日志写入失败不能阻止进程回收。"""
+    kwargs.setdefault("flush", True)
+    stream = kwargs.get("file") or sys.stdout
+    try:
+        print(*args, **kwargs)
+    except (OSError, ValueError):
+        if stream is not sys.stdout and stream is not sys.stderr:
+            return
+        try:
+            descriptor = stream.fileno()
+            sink = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(sink, descriptor)
+            finally:
+                if sink != descriptor:
+                    os.close(sink)
+        except (OSError, ValueError, AttributeError):
+            replacement = open(os.devnull, "w")
+            if stream is sys.stdout:
+                sys.stdout = replacement
+            else:
+                sys.stderr = replacement
+        # 解释器退出还会 flush 标准流；改接空设备避免清理成功却返回 120。
+
+
+def stop_signals() -> tuple[signal.Signals, ...]:
+    signals = (signal.SIGINT, signal.SIGTERM)
+    hangup = getattr(signal, "SIGHUP", None)
+    # nohup 明确忽略的 SIGHUP 应继续忽略；前台 SSH 断联则正常清理。
+    if hangup is not None and signal.getsignal(hangup) != signal.SIG_IGN:
+        signals += (hangup,)
+    return signals
 
 
 @dataclass(frozen=True)
@@ -203,9 +240,9 @@ def prepare_web_dependencies(root: Path, services: list[Service], env: dict[str,
     stamp.parent.mkdir(parents=True, exist_ok=True)
     # npm ci 失败时可能留下部分 node_modules，不能继续沿用上次成功的签名。
     stamp.unlink(missing_ok=True)
-    print("安装 Vue 锁定依赖（npm ci）…", flush=True)
-    process = start(Service("Vue 依赖安装", [service.command[0], "ci", "--no-audit", "--no-fund"], web), env)
-    processes.append(process)
+    output("安装 Vue 锁定依赖（npm ci）…")
+    process = start_temporary(
+        Service("Vue 依赖安装", [service.command[0], "ci", "--no-audit", "--no-fund"], web), env, processes)
     result = process.wait()
     if result != 0:
         raise RuntimeError(f"Vue 依赖安装失败（npm ci 退出码 {result}），未启动项目服务。")
@@ -239,6 +276,32 @@ def start(service: Service, env: dict[str, str]) -> subprocess.Popen:
     process = subprocess.Popen(service.command, cwd=service.cwd, env={**env, **dict(service.extra_env)}, **kwargs)
     process._avalon_identity = identity(process.pid)
     return process
+
+
+def start_temporary(service: Service, env: dict[str, str], processes: list[subprocess.Popen]) -> subprocess.Popen:
+    """仅主线程准备阶段使用：完成进程身份与清理登记后再处理停止信号。"""
+    previous = {}
+    pending = []
+
+    def defer(sig, frame):
+        if not pending:
+            pending.append((sig, frame))
+
+    for sig in stop_signals():
+        handler = signal.getsignal(sig)
+        if callable(handler):
+            previous[sig] = handler
+            signal.signal(sig, defer)
+    try:
+        process = start(service, env)
+        processes.append(process)
+        return process
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if pending:
+            sig, frame = pending[0]
+            previous[sig](sig, frame)
 
 
 def wait_ready(service: Service, process: subprocess.Popen, timeout: float) -> None:
@@ -352,8 +415,22 @@ def probe(service: Service) -> dict[str, Any]:
                         return {"ok": False, "reason": "尚无 OneBot 连接"}
                 elif body.get("ok") is not True or body.get("service") != expected:
                     return {"ok": False, "reason": f"{expected} 健康检查未通过"}
+        except HTTPError as exc:
+            detail = f"HTTP {exc.code}"
+        except URLError as exc:
+            if isinstance(exc.reason, ConnectionRefusedError):
+                detail = "连接被拒绝，服务尚未监听"
+            elif isinstance(exc.reason, TimeoutError):
+                detail = "连接超时"
+            else:
+                detail = type(exc.reason).__name__
         except (OSError, ValueError) as exc:
-            return {"ok": False, "reason": f"健康检查失败：{type(exc).__name__}"}
+            detail = type(exc).__name__
+        else:
+            continue
+        address = urlsplit(url)
+        target = f"{expected or service.key or service.name} {address.hostname}:{address.port}"
+        return {"ok": False, "reason": f"{target} 健康检查失败：{detail}"}
     return {"ok": True, "reason": "健康检查通过"}
 
 
@@ -371,7 +448,7 @@ async def run_managed(root: Path, services: list[Service], env: dict[str, str], 
         scan_fn=lambda service: find_goqbot(Path(service.command[0]), service.config_path),
         stop_matches_fn=lambda matches: terminate(matches, grace=settings["shutdown_grace"]),
         watcher_fn=watcher.changed,
-        echo=lambda message: print(message, flush=True),
+        echo=output,
     )
     loop = asyncio.get_running_loop()
 
@@ -382,24 +459,30 @@ async def run_managed(root: Path, services: list[Service], env: dict[str, str], 
         return future.result(timeout=30)
 
     server = ControlServer(root, handle).start()
-    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    previous = {sig: signal.getsignal(sig) for sig in stop_signals()}
     for sig in previous:
         try:
             loop.add_signal_handler(sig, supervisor.request_shutdown)
         except (NotImplementedError, RuntimeError):
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(supervisor.request_shutdown))
+    shutdown_error = None
     try:
-        print("运行监护已启用；另开终端用 uv run main.py status 查看，Ctrl+C 停止本次管理的服务。", flush=True)
+        output("运行监护已启用；另开终端用 uv run main.py status 查看，Ctrl+C 停止本次管理的服务。")
         await supervisor.run()
         return 0
+    except BaseException as exc:
+        shutdown_error = str(exc) or type(exc).__name__
+        raise
     finally:
-        await asyncio.to_thread(server.close)
-        for sig, handler in previous.items():
-            try:
-                loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError):
-                pass
-            signal.signal(sig, handler)
+        try:
+            await asyncio.to_thread(server.close, error=shutdown_error)
+        finally:
+            for sig, handler in previous.items():
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
+                signal.signal(sig, handler)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -416,23 +499,24 @@ def parser() -> argparse.ArgumentParser:
     reload_command = sub.add_parser("reload", help="切换 backend / nonebot 的源码自动重载")
     reload_command.add_argument("targets", nargs="+", metavar="组件")
     reload_command.add_argument("--off", action="store_true", help="关闭源码监听")
-    sub.add_parser("down", help="关闭监护及本次管理的组件")
+    down_command = sub.add_parser("down", help="关闭监护及本次管理的组件，并等待退出结果")
+    down_command.add_argument("--timeout", type=float, default=90, metavar="秒", help="等待关闭的秒数，默认 90")
     sub.add_parser("check", help="与 --check 相同")
     return result
 
 
 def print_states(result: dict) -> None:
     rows = result.get("states", result.get("services", []))
-    print(f"{'组件':<12}{'状态':<10}{'进程':<9}{'重启':<7}{'源码监听':<10}说明")
+    output(f"{'组件':<12}{'状态':<10}{'进程':<9}{'重启':<7}{'源码监听':<10}说明")
     for item in rows:
         status = LABELS.get(item.get("status", ""), item.get("status", "未知"))
-        print(f"{item.get('key', ''):<12}{status:<10}{str(item.get('pid') or '—'):<9}"
+        output(f"{item.get('key', ''):<12}{status:<10}{str(item.get('pid') or '—'):<9}"
               f"{str(item.get('restarts', 0)):<7}{'开' if item.get('reload') else '关':<10}{item.get('message', '')}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    from launcher.control import ControlError, InstanceLock, request
+    from launcher.control import ControlError, InstanceLock, request, wait_stopped
 
     try:
         if args.action not in (None, "check"):
@@ -443,14 +527,24 @@ def main(argv: list[str] | None = None) -> int:
             payload: dict[str, Any] = {"action": action, "targets": selected}
             if action == "reload":
                 payload["enabled"] = not args.off
+            if action == "down" and (not math.isfinite(args.timeout) or not 0 < args.timeout < 86400):
+                raise ValueError("down --timeout 必须大于 0 且小于 86400 秒")
             result = request(ROOT, payload, timeout=35)
+            if action == "down" and result.get("ok", True):
+                output("关闭请求已受理，正在等待组件清理和启动器退出…")
+                result = wait_stopped(ROOT, result["instance_id"], timeout=args.timeout)
+                if result.get("ok"):
+                    output(result["message"])
+                    return 0
+                output(result.get("error") or "无法确认关闭结果。", file=sys.stderr)
+                return 1
             if getattr(args, "json", False):
-                print(json.dumps(result, ensure_ascii=False, indent=2))
+                output(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 if not result.get("ok", True):
-                    print(result.get("error") or result.get("message") or "管理请求失败。", file=sys.stderr)
+                    output(result.get("error") or result.get("message") or "管理请求失败。", file=sys.stderr)
                 elif action != "status":
-                    print(result.get("message") or "管理请求已受理，组件状态将按请求更新。")
+                    output(result.get("message") or "管理请求已受理，组件状态将按请求更新。")
                 print_states(result)
             return 0 if result.get("ok", True) else 1
 
@@ -458,20 +552,20 @@ def main(argv: list[str] | None = None) -> int:
         settings = launcher_settings(ROOT, reload_components)
         services, skipped = plan(ROOT)
         for message in skipped:
-            print(message, flush=True)
+            output(message)
         if args.check or args.action == "check":
             ensure_ports_free(services)
             for service in services:
-                print(f"已检查 {service.key or service.name}：{service.cwd.relative_to(ROOT)}")
+                output(f"已检查 {service.key or service.name}：{service.cwd.relative_to(ROOT)}")
                 if service.config_path and not service.config_path.is_file():
-                    print(f"首次启动时生成 {service.config_path.relative_to(ROOT)}")
+                    output(f"首次启动时生成 {service.config_path.relative_to(ROOT)}")
             return 0
         with InstanceLock(ROOT):
             env = child_environment(ROOT)
             # 原生程序负责首次生成配置；此路径不安装网站依赖，也不要求业务端口空闲。
             setup = next((s for s in services if s.config_path and not s.config_path.is_file()), None)
             temporary: list[subprocess.Popen] = []
-            previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+            previous = {sig: signal.getsignal(sig) for sig in stop_signals()}
 
             def interrupted(*_):
                 for sig in previous:
@@ -482,9 +576,8 @@ def main(argv: list[str] | None = None) -> int:
                 signal.signal(sig, interrupted)
             try:
                 if setup:
-                    print(f"goqbot 将生成 {setup.config_path.relative_to(ROOT)}；填写后重新启动项目。", flush=True)
-                    process = start(setup, env)
-                    temporary.append(process)
+                    output(f"goqbot 将生成 {setup.config_path.relative_to(ROOT)}；填写后重新启动项目。")
+                    process = start_temporary(setup, env, temporary)
                     result = process.wait()
                     if result == 0 and not setup.config_path.is_file():
                         raise RuntimeError("goqbot 已退出但未生成配置，请检查其版本与参数。")
@@ -501,10 +594,10 @@ def main(argv: list[str] | None = None) -> int:
                     for sig, handler in previous.items():
                         signal.signal(sig, handler)
     except KeyboardInterrupt:
-        print("已停止本次启动。", flush=True)
+        output("已停止本次启动。")
         return 0
     except (OSError, RuntimeError, ValueError, ControlError) as exc:
-        print(f"运行管理失败：{exc}", file=sys.stderr, flush=True)
+        output(f"运行管理失败：{exc}", file=sys.stderr)
         return 1
 
 

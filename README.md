@@ -56,12 +56,15 @@ uv run main.py
 | `uv run main.py start all` | 恢复全部已配置组件及其依赖 |
 | `uv run main.py reload backend nonebot` | 开启这两个组件的源码监听，变更后分别重载 |
 | `uv run main.py reload backend nonebot --off` | 关闭源码监听 |
-| `uv run main.py down` | 退出根启动器并清理本次拥有的进程，与 Ctrl+C 相同 |
+| `uv run main.py down` | 清理本次拥有的进程，等待启动器退出并报告结果，默认最多等待 90 秒 |
+| `uv run main.py down --timeout 180` | 为较慢的正常清理延长等待时间 |
 
 组件名为 `backend`（API + Logic）、`nonebot`、`goqbot`、`web`；查询和启停命令可指定多个组件或 `all`。
 只有 `start` 会递归恢复依赖；`restart`、`stop` 只作用于指定目标，不撤销其他组件的手动停止状态。
 例如先 `stop backend` 再 `restart nonebot`，NoneBot 会等待后端，需明确 `start backend` 才会恢复。
 管理命令需要已有根启动器；不会隐式启动另一整套项目。运行中可反复用 `status` 查看操作是否完成。
+`down` 会等待原实例释放锁并核验退出回执；超时、清理失败或无法确认清理结果都会明确报错，
+不再用关闭前的状态表表示关闭结果。临时回执位于 `data/run/launcher-<实例标识>.exit.json`，不包含控制凭据。
 
 也可在根启动时开启监听：`uv run main.py --reload backend nonebot`；单独写 `--reload` 默认仅监听后端。
 Vue 使用 Vite 自己的 HMR；goqbot 自行管理更新，不加入 Python 源码监听。
@@ -77,6 +80,24 @@ Vue 使用 Vite 自己的 HMR；goqbot 自行管理更新，不加入 Python 源
 进程消失先等待默认 120 秒自行重启，再确认不存在后重试；进程仍在但 OneBot 断线时等待默认 300 秒，之后只提示离线，不杀进程。
 启动时已存在的匹配 goqbot 仅附着观察，Ctrl+C/`down` 不清理它；显式 `stop goqbot` 或 `restart goqbot` 才会停止该实例。
 详细边界见 [goqbot 说明](bot/goqbot/README.md)。
+
+## SSH 终端与服务器运行
+
+前台 `uv run main.py` 收到终端挂断信号（SIGHUP）时会正常清理本次启动的组件。
+终端输出不可写不会中止监护循环或清理。需要退出 SSH 后继续运行时，完成首次配置后在项目根目录执行：
+
+```sh
+mkdir -p data/logs
+nohup env PYTHONUNBUFFERED=1 uv run main.py >> data/logs/launcher.log 2>&1 < /dev/null &
+```
+
+`nohup` 继承的 SIGHUP 忽略设置会保留，组件输出记录在 `data/logs/launcher.log`。
+重新登录后，在同一项目根目录使用 `uv run main.py status` 查询，使用 `uv run main.py down` 关闭。
+用 `tail -n 100 data/logs/launcher.log` 查看后端启动日志；健康错误会显示具体服务、地址和连接失败原因。
+
+再次执行启动提示已有实例时，先查询现有实例，不要删除 `data/run/launcher.lock`；
+锁文件存在不等于锁仍被占用，删除文件可能导致两个启动器同时运行。
+Linux root 用户的无可执行文件、无命令行的内核线程，以及明确无关的进程，不会再阻塞 goqbot 识别。
 
 ## 独立启动与环境
 
